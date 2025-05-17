@@ -5,6 +5,7 @@ const rooms = {
 
 }
 
+
 const usedSSRCs = new Set();
 
 function generateUniqueSSRC() {
@@ -27,37 +28,52 @@ const send = (route, ws, response) => {
    }
 }
 
-const handleCreateRoom = async ({ ws }) => {
+const generateUserResponse = async (ws, room, userId) => {
+    try {
+        room.addUser(ws);
+
+        room.setName(ws, 'PRODUCER')
+        room.setInfo(ws, 'producer', userId);
+
+        ws.currentRoom = room.roomId;
+
+        room.setProducerId(userId);
+
+        const transport = await room.createTransport(ws);
+        const transportOptions = {
+            id: transport.id,
+            iceParameters: transport.iceParameters,
+            iceCandidates: transport.iceCandidates,
+            dtlsParameters: transport.dtlsParameters
+        };
+
+        return {transportOptions, routerRtpCapabilities: room.router.rtpCapabilities}
+    } catch (err) {
+        console.error("generateUserResponse err: ", err);
+    }
+}
+
+const handleCreateRoom = async ({ ws, userId }) => {
     try {
         const roomId = uuidv4();
-  
+        
+
         if (!rooms[roomId]) {
             const room = new Room(roomId);
             await room.initializeRouter();
         
             rooms[roomId] = room;
 
-        
-            room.addUser(ws);
+            const res = await generateUserResponse(ws, room, userId);
 
-            room.setName(ws, 'PRODUCER')
-        
-            const transport = await room.createTransport(ws);
-            const transportOptions = {
-                id: transport.id,
-                iceParameters: transport.iceParameters,
-                iceCandidates: transport.iceCandidates,
-                dtlsParameters: transport.dtlsParameters
-            };
             
             send('/roomCreated', ws, {
                 roomId,
-                transportOptions,
-                routerRtpCapabilities: room.router.rtpCapabilities
+                ...res
             }) 
         } else {
             send('/error', ws, {
-                message: 'Room already exists'
+                message: 'Room already exists'  
             }) 
         }
     } catch(err) {
@@ -86,9 +102,6 @@ const handleCreateRoom = async ({ ws }) => {
             }
         });
 
-       
-
-
         producer.observer.on('pause', () => {
             console.log('pause producer')
         });
@@ -99,7 +112,6 @@ const handleCreateRoom = async ({ ws }) => {
 
         producer.appointment = appointment
 
-        console.log("PRODUCER ID - ", producer.id, ' _ ',  producer.appointment)
       
         room.saveProducer(ws, producer);
 
@@ -128,6 +140,13 @@ const handleCreateRoom = async ({ ws }) => {
         const transport = room.getTransport(ws);
         if (!transport) throw new Error('Transport not found for user');
 
+        if (transport.connected) {
+            send('/transportConnected', ws, { 
+                message: 'Transport already connected'
+            }) 
+            return;
+        }
+
         await transport.connect({ dtlsParameters })
 
         send('/transportConnected', ws, { 
@@ -141,24 +160,30 @@ const handleCreateRoom = async ({ ws }) => {
 
  const handleRemoveRoom = async ({ws, roomId}) => {
     try {
+        console.log('roomID - ', roomId)
         const room = rooms[roomId];
-        
         if (!room) throw new Error('Room not found');
-
         room.broadcast({type: 'removeRoom'}, ws)
-
         delete rooms[roomId];
-
     } catch(err) {
         console.error('handleRemoveRoom error: ', err)
     }
  }
 
- const handleCheckRoom = async ({ws, roomId}) => {
+ const handleCheckRoom = async ({ws, roomId, userId}) => {
     try {
         const room = rooms[roomId];
-        console.log(Object.keys(rooms))
-        send('/roomStatus', ws, {isExist: !!room})
+        let recconect = false
+        if(room) {
+            console.log(room.producerUserId, userId, room.active)
+            if(room.producerUserId == userId && room.active == 'sleep') {
+                recconect = true
+            }
+        } else {
+            send('/removedRoom', ws, {});
+            return;
+        }
+        send('/roomStatus', ws, {isExist: !!room, recconect})
 
     } catch(err) {
         console.error('handleRemoveRoom error: ', err)
@@ -173,12 +198,13 @@ const handleCreateRoom = async ({ ws }) => {
         const user = room.getUser(ws);
         if (!user) return send('/error', ws, { message: 'User not found' });
 
-        const listenProducer = user.listenProducer || [];
-        console.log(room.producers
-            .map(data => data.producer.id))
+        const listenProducers = user.listenProducers || [];
+
+        console.log('listenProducer - ', listenProducers)
+
         const consumeProducerList = room.producers
             .map(data => data.producer.id)
-            .filter(id => !listenProducer.includes(id));
+            .filter(id => !listenProducers.includes(id));
 
         const rtpCapabilities = room.router.rtpCapabilities;
         const transport = room.getTransport(ws);
@@ -192,7 +218,7 @@ const handleCreateRoom = async ({ ws }) => {
 
             const canConsume = room.router.canConsume({ producerId, rtpCapabilities });
             if (!canConsume) {
-                console.warn(`Cannot consume producer ${producerId}`);
+                console.warn(`Cannot consume producer ${producerId} - ${producer.appointment}`);
                 continue;
             }
             room.addListenProducersForConsumer(ws, producerId)
@@ -203,7 +229,9 @@ const handleCreateRoom = async ({ ws }) => {
                 paused: false,
             });
 
-            consumer.observer.on("close", () => send('/offTrack', ws, {producerId}))
+            consumer.observer.on("close", () => {
+                send('/offTrack', ws, {producerId})
+            })
 
             room.addConsumer(ws, consumer);
 
@@ -224,15 +252,17 @@ const handleCreateRoom = async ({ ws }) => {
 }
 
 
- const handleJoinRoom = async ({ws, roomId, producerId, rtpCapabilities}) => {
+ const handleJoinRoom = async ({ws, roomId, producerId, rtpCapabilities, userId}) => {
     try {
         const room = rooms[roomId];
         if (!room) throw new Error('Room not found');
-
         
         room.addUser(ws);
 
         room.setName(ws, `consumer - ${(new Date().getTime())}`)
+        room.setInfo(ws, 'consumer', userId);
+
+        ws.currentRoom = roomId;
         
         const transport = await room.createTransport(ws);
         const transportOptions = {
@@ -255,17 +285,20 @@ const handleCreateRoom = async ({ ws }) => {
     try {
         const room = rooms[roomId];
         if (!room) return ws.send(JSON.stringify({ type: 'error', message: 'Room not found' }));
-        const producerId = room.producers.map(data => data.producer.id)[0]
-        const producer = room.findProducerById(producerId);
+        const producersId = room.producers.filter(data => data.producer.kind == 'audio').map(data => data.producer.id)
+        
+        for(const id of producersId) {
+            const producer = room.findProducerById(id);
 
-        if(mute) {
-            producer.pause()
-        } else {
-            producer.resume()
+            if(mute) {
+                producer.pause()
+            } else {
+                producer.resume()
+            }
         }
 
         room.broadcast({type: 'mute', mute})
-        console.log('Producer - ', producer._events)
+  
         // console.log('mute micro - ', mute)
     } catch {
         console.error('muteMicro error: ', err)
@@ -277,6 +310,7 @@ const handleRemoveProducer = ({ws, producerId, roomId}) => {
         const room = rooms[roomId];
         if (!room) return send('/error', ws, { message: 'Room not found' });
         const producer = room.findProducerById(producerId);
+        console.log('CLOSE PRODUCER - ', producer.id)
         producer.close();
     } catch (err) {
         console.error('handleRemoveProducer error: ', err)
@@ -296,6 +330,75 @@ const handleSendMessage = ({ws, roomId, message}) => {
     }
 }
 
+export const handleLeaveUser = (ws) => {
+    try {
+        if(ws.currentRoom) {
+            const room = rooms[ws.currentRoom]
+            const user = room.getUser(ws)
+
+            if(user?.type == 'producer') {
+                room.setActiveRoom('sleep');
+                room.broadcast({type: 'sleep'}, ws);
+                room.startProducerTimeout();
+            } else {
+                room.removeUser(ws);
+                
+            }
+
+        }
+    } catch (err) {
+        console.error('handleLeaveUser error: ', err)
+    }
+}
+
+export const handleRestartSFU = ({roomId, ws}) => {
+    try {
+        const room = rooms[roomId];
+        if(!room) {
+            send('/removedRoom', ws, {});
+            return;
+        }
+        room.clearProducerTimeout();
+        room.setActiveRoom('active');
+        room.broadcast({type: 'producerRestartSFU'}, ws);
+    } catch (err) {
+        console.error('handleRestartSFU error: ', err)
+    }
+}
+
+export const handleRecconect = async ({ws, userId, roomId}) => {
+    try {
+        const room = rooms[roomId]
+        if(!room) {
+            send('/removedRoom', ws, {});
+            return;
+        }
+
+        const res = await generateUserResponse(ws, room, userId);
+        const tracksType = [...new Set(room.producers.map(p => p.producer.appointment).filter(item => item !== 'audio'))];
+        send('/startRecconect', ws, {tracksType, ...res});
+        for (const u of room.users) {
+            u.consumers = []
+        }
+    } catch(err) {
+        console.error('handleRecconect error: ', err)
+    }
+}
+
+export const handleTimeoutRemoveRoom = (roomId) => {
+    try {
+        const room = rooms[roomId];
+        if (!room) throw new Error('Room not found');
+        room.broadcastAll({type: 'removeRoom'});
+        rooms[roomId].destroy();
+        delete rooms[roomId];
+
+        console.log('ROOMS LENGTH - ', Object.values(rooms).length)
+    } catch (err) {
+        console.error('handleTimeoutRemoveRoom error: ', err);
+    }
+}
+
 
 export const routes = {
     'create-room': handleCreateRoom,
@@ -307,5 +410,13 @@ export const routes = {
     'create-consumer': handleCreateConsumer,
     'mute-micro': muteMicro,
     'remove-producer': handleRemoveProducer,
-    'send-message': handleSendMessage
+    'send-message': handleSendMessage,
+    'recconect': handleRecconect,
+    'restart-sfu': handleRestartSFU
 }
+
+
+// active tab, other tab (user id one)
+// if tab closed -> producer sleep
+// if time < 300 && reload then id == producer id -> active tab
+// 

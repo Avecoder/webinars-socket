@@ -1,7 +1,7 @@
 import WebSocket, {WebSocketServer} from "ws";
 import dotenv from 'dotenv'
 dotenv.config()
-import { routes } from "./actions.js";
+import { handleLeaveUser, routes } from "./actions.js";
 
 
 export const PORT = process.env.WS_PORT || 5555;
@@ -31,9 +31,7 @@ webSocket.on('connection', (ws) => {
     
     ws.on('message', (message) =>  action(message, ws));
   
-    // Когда клиент закрывает соединение
     ws.on('close', () => {
-      
-      console.log('close')
+      handleLeaveUser(ws)
     });
   });

@@ -1,5 +1,8 @@
 import { createWorker } from 'mediasoup';
-import { v4 as uuidv4 } from 'uuid';
+import { handleTimeoutRemoveRoom } from './actions.js';
+
+const SECONDS = 15;
+const TIMEOUT_MAX = (SECONDS / 60) * 60 * 1000;
 
 export class Room {
   constructor(roomId) {
@@ -10,6 +13,10 @@ export class Room {
     this.worker = null;
     this.router = null;
     this.message = []
+    this.producerUserId = null
+    this.active = 'live'
+    this.producerLeaveUnix = 0;
+    this.producerTimeout = null;
   }
 
   async initializeRouter() {
@@ -53,9 +60,15 @@ export class Room {
         producers: [],
         consumers: [],
         listenProducers: [],
-        name: ''
+        name: '',
+        type: null,
+        userId: null
       });
     }
+  }
+
+  setProducerId(id) {
+    this.producerUserId = id;
   }
 
   removeUser(ws) {
@@ -74,7 +87,10 @@ export class Room {
   }
 
   addListenProducersForConsumer(ws, producerId) {
-    this.users.map(user => user.socket == ws ? {...user, listenProducers: [...user.listenProducers, producerId]} : user)
+    const user = this.getUser(ws);   
+    if (user) {
+      user.listenProducers.push(producerId);
+    }
   }
 
   getTransportBySocket(ws) {
@@ -116,6 +132,10 @@ export class Room {
     return producer;
   }
 
+  clearProducers() {
+    this.producers = [];
+  }
+
   saveProducer(ws, producer) {
     this.producers.push({ socket: ws, producer });
 
@@ -130,6 +150,18 @@ export class Room {
     if (user) {
       user.consumers.push(consumer);
     }
+  }
+
+  setInfo(ws, type, userId) {
+    const user = this.getUser(ws);
+    if (user) {
+      user.type = type;
+      user.userId = userId;
+    }
+  }
+
+  setActiveRoom(type) {
+    this.active = type;
   }
 
   getAllTransports() {
@@ -171,4 +203,130 @@ export class Room {
       }
     }
   }
+
+  setProducerLeaveTime() {
+    this.producerLeaveUnix = (new Date()).getTime();
+  }
+
+  removeUser(ws) {
+    const user = this.getUser(ws);
+    if (!user) return;
+
+    for (const producer of user.producers) {
+      try {
+        producer.close();
+      } catch (e) {
+        console.warn('Error closing producer:', e);
+      }
+    }
+  
+    for (const consumer of user.consumers) {
+      try {
+        consumer.close();
+      } catch (e) {
+        console.warn('Error closing consumer:', e);
+      }
+    }
+  
+  
+    if (user.transport) {
+      try {
+        user.transport.close();
+      } catch (e) {
+        console.warn('Error closing transport:', e);
+      }
+    }
+  
+    this.transports = this.transports.filter(t => t.appData.socket !== ws);
+  
+    this.producers = this.producers.filter(p => p.socket !== ws);
+  
+    this.users = this.users.filter(user => user.socket !== ws);
+  }
+
+  
+  startProducerTimeout() {
+    const START_TIME = (new Date()).getTime();
+    if (this.producerTimeout) clearTimeout(this.producerTimeout);
+  
+    this.producerTimeout = setTimeout(() => {
+      
+      console.log('TIMER - ', (new Date()).getTime() - START_TIME)
+      if (this.active == 'sleep') {
+        handleTimeoutRemoveRoom(this.roomId);
+      }
+    }, TIMEOUT_MAX);
+  }
+
+  clearProducerTimeout() {
+    if (this.producerTimeout) {
+      clearTimeout(this.producerTimeout);
+      this.producerTimeout = null;
+    }
+  }
+
+  destroy() {
+    // Закрыть всех пользователей
+    for (const user of this.users) {
+      // Закрыть consumer'ов
+      for (const consumer of user.consumers) {
+        try {
+          consumer.close(); // Уничтожает Consumer внутри mediasoup
+        } catch (e) {
+          console.warn('Ошибка при закрытии consumer:', e);
+        }
+      }
+  
+      // Закрыть producer'ов
+      for (const producer of user.producers) {
+        try {
+          producer.close(); // Уничтожает Producer внутри mediasoup
+        } catch (e) {
+          console.warn('Ошибка при закрытии producer:', e);
+        }
+      }
+  
+      // Закрыть транспорт
+      if (user.transport) {
+        try {
+          user.transport.close(); // Уничтожает Transport внутри mediasoup
+        } catch (e) {
+          console.warn('Ошибка при закрытии транспорта:', e);
+        }
+      }
+    }
+  
+    // Очистить router
+    if (this.router) {
+      try {
+        this.router.close(); // Освобождает Router
+      } catch (e) {
+        console.warn('Ошибка при закрытии router:', e);
+      }
+    }
+  
+    // Закрыть worker (если он только под эту комнату)
+    if (this.worker) {
+      try {
+        this.worker.close(); // Закрывает Worker
+      } catch (e) {
+        console.warn('Ошибка при закрытии worker:', e);
+      }
+    }
+  
+    // Очищаем внутренние структуры
+    this.users = [];
+    this.transports = [];
+    this.producers = [];
+    this.router = null;
+    this.worker = null;
+    this.producerUserId = null;
+    this.producerLeaveUnix = 0;
+  
+    // Очищаем таймер, если был
+    this.clearProducerTimeout();
+  }
+  
 }
+
+
